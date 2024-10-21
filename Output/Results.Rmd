@@ -1,0 +1,255 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+We start by setting up the environment and importing the data necessary
+
+```{r}
+# install.packages("here")
+library("here")
+library("PerformanceAnalytics")
+source(here("Function","f_forecast_var.R"))
+
+# Load the data and include the index values since January 2005
+indices <- load(file = here("Data","indices.rda"))
+
+SP500_p <- prices$SP500["2005-01-01/"]
+FTSE100_p <- prices$FTSE100["2005-01-01/"]
+```
+We then compute the log-returns of both of our series, and vectorize them so as to increase the efficiency of future computations
+
+```{r}
+# Compute the log returns for both series
+log_ret_SP500 <- PerformanceAnalytics::CalculateReturns(SP500_p, method = "log")
+log_ret_FTSE100 <- PerformanceAnalytics::CalculateReturns(FTSE100_p, method = "log")
+
+log_ret_SP500 <- log_ret_SP500[-1,]
+log_ret_FTSE100 <- log_ret_FTSE100[-1,]
+
+# Vectorization
+dates_log_ret_SP500 <- (log_ret_SP500[, 1])
+log_ret_SP500 <- as.numeric(log_ret_SP500)
+
+dates_log_ret_FTSE100 <- (log_ret_FTSE100[, 1])
+log_ret_FTSE100 <- as.numeric(log_ret_FTSE100)
+```
+Before we can do the actual estimation and backtest of the VaR of the two indices, we first have to complete the VaR forecast function that was given. The completed function is shown below.
+
+```{r}
+f_forecast_var <- function(y, level) {
+  ### Compute the VaR forecast of a GARCH(1,1) model with Normal errors at the desired risk level
+  #  INPUTS
+  #   y     : [vector] (T x 1) of observations (log-returns)
+  #   level : [scalar] risk level (e.g. 0.95 for a VaR at the 95# risk level)
+  #  OUTPUTS
+  #   VaR   : [scalar] VaR forecast 
+  #   sig2  : [vector] (T+1 x 1) conditional variances
+  #   theta : [vector] GARCH parameters
+  #  NOTE
+  #   o the estimation is done by maximum likelihood
+  
+  # Fit a GARCH(1,1) model with Normal errors
+  # Starting values and bounds
+  # The parameters must satisfy a0>=0, a1>0, b1>0
+  theta0 <- c(0.1 * var(y), 0.1, 0.8)
+  LB     <- c(0, 1e-5, 1e-5) # Bounds for the a0, a1, b1
+  
+  # ConstrOptim function expects the form Ax >= b
+  # The implementation of the value 1e-5 which is slightly greater than zero, is employed to guarantee the satisfaction of the strictly "> b" or "< b" constraints
+  # For the =< and < constraints, we need to multiply both sides by -1 to flip the inequality
+  
+  
+  # Stationarity condition
+  # The GARCH(1,1) is stationary if the sum of a1 + b1 < 1
+  # The implementation of the value -1+1e-5 (slightly greater than -1) is to ensure the satisfaction of a1+b1 < 1
+  # Now combining the stationarity condition and the lower bound in a system of linear inequalities such that : Ax >=b 
+  # Vector b size : size(LB)+1 , as it includes the elements of the lowe bounds (LB) and the additional stationarity condition
+  
+  A <- matrix(c(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1, -1), nrow=4, byrow=TRUE)
+  b      <- c(LB,(-1+1e-5))  
+  
+  # Each row of A corresponds to a linear inequality, and the corresponding entry in b is the constant term for that inequality
+  
+  # Run the optimization
+  optimization <- constrOptim(theta = theta0,
+                     f = f_nll,
+                     y = y,
+                     grad = NULL,
+                     ui = A,
+                     ci = b,)
+  
+  theta = c(optimization$par[1], optimization$par[2], optimization$par[3])    # Saving the resulting parameters 
+  
+  # Recompute the conditional variance
+  sig2 <- f_ht(theta, y) 
+  
+  # Compute the next-day ahead VaR for the Normal model
+  VaR <- qnorm(1-level,0,1)*sqrt(sig2) 
+  
+  out <- list(VaR_Forecast = VaR, 
+              ConditionalVariances = sig2, 
+              GARCH_param = theta)
+  
+  out
+}
+
+f_nll <- function(theta, y) {
+  ### Fonction which computes the negative log likelihood value 
+  ### of a GARCH model with Normal errors
+  #  INPUTS
+  #   theta  : [vector] of parameters
+  #   y      : [vector] (T x 1) of observations
+  #  OUTPUTS
+  #   nll    : [scalar] negative log likelihood value
+  
+  T <- length(y) # number of observations
+  
+  # Compute the conditional variance of a GARCH(1,1) model
+  sig2 <- f_ht(theta, y) 
+  
+  # Consider the T values
+  sig2 <- sig2[1:T]
+  
+  # Compute the loglikelihood
+  # Initialization
+  ll<- 0 
+  for (t in 1:T){
+    ll <- ll + dnorm(y[t], mean = 0, sd = sqrt(sig2[t]), log = TRUE)
+  }
+  
+  # Output the negative value
+  nll <- -ll
+  
+  # Returns the negative log-likelihood value
+  nll
+}
+
+f_ht <- function(theta, y)  {
+  ### Function which computes the vector of conditional variance
+  #  INPUTS
+  #   x0 : [vector] (3 x 1)
+  #   y     : [vector] (T x 1) log-returns
+  #  OUTPUTS 
+  #   sig2  : [vector] (T+1 x 1) conditional variances
+  
+  # Extract the parameters
+  a0 <- theta[1]
+  a1 <- theta[2]
+  b1 <- theta[3]
+  
+  T <- length(y)
+  
+  # Initialize the conditional variances
+  sig2 <- rep(NA, T + 1) 
+  
+  # Start with unconditional variances
+  sig2[1] <- a0 / (1 - a1 - b1)
+  
+  # Compute conditional variance at each step
+  for(t in 2:(T + 1)) { 
+    sig2[t] <- a0 + a1 * y[t-1]^2 + b1 * sig2[t-1] #formula of conditional variance
+  }
+  
+  # Returns the conditional variance values
+  sig2
+}
+```
+Now that we have the completed function, we can use it to compute the the 1-step ahead forecast using the first 1000 log-returns.
+
+```{r}
+### Static estimation of the VaR
+# Using the first 1000 log-returns 
+T = 1000
+# Setting the risk level
+level = 0.95 
+# Computibg the static VaR Forecast
+staticForecast_SP500 <- f_forecast_var(log_ret_SP500[1 : T], level)
+staticForecast_FTSE100 <- f_forecast_var(log_ret_FTSE100[1 : T], level)
+# Extracting the variable of interest
+print('Static forecast for the SP500:')
+staticForecast_SP500$VaR_Forecast[T + 1]
+print('Static forecast for the FTSE100:')
+staticForecast_FTSE100$VaR_Forecast[T + 1]
+```
+Given these results, we can conclude that the SP500 is riskier at the T+1 horizon since its magnitude is greater than the FTSE100. 
+
+The final step is to use backtesting in order to evaluate how our forecasts hold when compared to the series of log-returns we computed prior.
+
+```{r}
+### Backtesting
+# Setting the rolling window
+T = 1000
+# Setting the risk level
+level = 0.95 
+# Initialization
+VaR_backtest_SP500 <- vector("numeric", length(log_ret_SP500) - T)
+VaR_backtest_FTSE100 <- vector("numeric", length(log_ret_FTSE100) - T)
+# Rolling window for backtesting, VaR forecasts
+for (i in (T + 1) : length(log_ret_SP500)) {
+  backtest_SP500 <- f_forecast_var(log_ret_SP500[(i-T):(i-1)], level)
+  VaR_backtest_SP500[i-T] <- backtest_SP500$VaR_Forecast[T+1]
+  backtest_FTSE100 <- f_forecast_var(log_ret_FTSE100[(i-T):(i-1)], level)
+  VaR_backtest_FTSE100[i-T] <- backtest_FTSE100$VaR_Forecast[T+1]
+}
+```
+Using the VaR forecasts that we just computed, all that is left to do is to plot them against the series of log-returns to evaluate their performance. Here we save the graphs in png format and the actual numeric results in a RData file.
+
+```{r}
+# Plotting realized returns vs VaR estimates
+# Organizing the data
+data_SP500_plot <- data.frame(RealizedReturns = log_ret_SP500[(T+1):length(log_ret_SP500)], 
+                              VaR_Forecasts = VaR_backtest_SP500[1:1215])
+data_FTSE100_plot <- data.frame(RealizedReturns = log_ret_FTSE100[(T+1):length(log_ret_FTSE100)], 
+                                VaR_Forecasts = VaR_backtest_FTSE100[1:1215])
+dates_backtest_SP500 <- dates_log_ret_SP500[(T+1):length(log_ret_SP500)]
+dates_backtest_FTSE100 <- dates_log_ret_FTSE100[(T+1):length(log_ret_FTSE100)]
+# Plots as png 
+png(file=here("Output", "VaR_Backtest_SP500.png"))
+plot(as.Date(index(dates_backtest_SP500)), data_SP500_plot$RealizedReturns, 
+     type = "l", 
+     col = "blue", 
+     ylim = range(c(data_SP500_plot$RealizedReturns, data_SP500_plot$VaR_Forecasts)), 
+     main = "SP500 log-returns and forecasted VaR", 
+     xlab = "Date",
+     ylab = "log (%)")
+lines(as.Date(index(dates_backtest_SP500)), data_SP500_plot$VaR_Forecasts, 
+      type = "l", 
+      col = "red")
+dev.off()
+
+
+png(file=here("Output", "VaR_Backtest_FTSE100.png"))
+plot(as.Date(index(dates_backtest_SP500)), data_FTSE100_plot$RealizedReturns, 
+     type = "l", 
+     col = "blue", 
+     ylim = range(c(data_FTSE100_plot$RealizedReturns, data_FTSE100_plot$VaR_Forecasts)), 
+     main = "FTSE100 log-returns and forecasted VaR", 
+     xlab = "Date", 
+     ylab = "log (%)")
+lines(as.Date(index(dates_backtest_SP500)), data_FTSE100_plot$VaR_Forecasts, 
+      type = "l", 
+      col = "red")
+dev.off()
+
+# Save backtest results to a rda file
+save(VaR_backtest_SP500, VaR_backtest_FTSE100, file = here("Output", "Backtest_Results.RData"))
+```
+The graph below shows the results of our backtest for the SP500 index.
+
+```{r, echo = FALSE}
+knitr::include_graphics(here("Output", "VaR_Backtest_SP500.png"))
+```
+The graph below shows the results of our backtest for the FTSE100 index.
+
+```{r, echo = FALSE}
+knitr::include_graphics(here("Output", "VaR_Backtest_FTSE100.png"))
+```
+
+
+
+
